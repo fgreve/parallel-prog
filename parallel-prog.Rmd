@@ -1,0 +1,164 @@
+---
+title: "Parallel Programming in R with parallel library"
+author: "Fernando Greve"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(DT)
+show_table <- function(df) {
+DT::datatable(df, class = 'cell-border stripe', rownames = FALSE, filter = "top", 
+              editable = TRUE, extensions = 'Buttons', 
+              options = list(dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')) )
+}
+```
+
+In this post I use one of the multiple R libraries for parallel computing. It is simple amazing how much can be achieved by  
+the strong open source R developer community. Here I show how easy it is to implement parallel programming in just some lines of R code. Then, I use it to solve a portfolio optimization. BTW, this is the link to my github accout the full replicability rmarkdown file for you to fork it and try it at home.   
+
+## Running the "apply" functions in parallel
+
+So first, let take a list containing four large vectors. For each of the four large vectors, we want to calculate the mean.
+
+
+```{r}
+# Generate data
+data <- 1:1e9
+data_list <- list("1" = data,
+                  "2" = data,
+                  "3" = data,
+                  "4" = data)
+# Single core
+time_benchmark <- system.time(
+  lapply(data_list, mean)
+)
+
+time_benchmark
+```
+
+It take 16.12 seconds, to calculate four simple (but quit large) averages? We can try now using the parallel library now to see the difference.
+
+
+```{r}
+library(parallel)
+# Detect the number of available cores and create cluster
+cl <- parallel::makeCluster(detectCores())
+# Run parallel computation
+time_parallel <- system.time(
+  parallel::parLapply(cl,
+                      data_list,
+                      mean)
+)
+# Close cluster
+parallel::stopCluster(cl)
+
+time_parallel
+```
+
+So, the time reduced by half.
+
+## Running portfolio optimisation in parallel
+
+We will try thisin a more complex/realistic problem. Let calculate a portfolio optimisation Firstly, it is necessary to load the libraries for both parallelisation and financial optimisation.
+
+```{r, results='hide', include=FALSE}
+# Load parallelisation libraries
+library(doParallel)
+library(foreach)
+library(parallel)
+
+# Load finance and optimization libraries
+library(PerformanceAnalytics)
+library(PortfolioAnalytics)
+require(ROI)
+require(ROI.plugin.glpk)
+require(ROI.plugin.quadprog)
+require(quadprog)
+```
+
+From the PerformanceAnalytics library, a sample data set containing financial returns for 13 instruments can be loaded:
+
+```{r}
+# Load sample return data from the PerformanceAnalytics library
+lookback <- 120 # lookback in months
+returns <- tail(PerformanceAnalytics::edhec, lookback)
+show_table(returns)
+```
+
+The code below creates the portfolio object to be optimised. To calculate the efficient frontier, it is necessary to know the maximum expected return and the minimum risk a portfolio built from the given universe of instruments can achieve:
+
+```{r}
+# Create portfolio object
+names_funds <- colnames(returns)
+port.obj <- PortfolioAnalytics::portfolio.spec(assets = names_funds)
+port.obj <- PortfolioAnalytics::add.constraint(portfolio = port.obj,
+                                               type = "full_weight")
+port.obj <- PortfolioAnalytics::add.constraint(portfolio = port.obj,
+                                               type="long_only")
+port.obj <- add.objective(portfolio=port.obj,
+                          type='risk',
+                          name='ETL',
+                          arguments=list(p=0.95))
+
+# Define maximum achievable return
+ER_assets <- colMeans(returns)
+ER_assets_max <- max(ER_assets)
+# Calculation of return of minimum risk portfolio
+weights_ES_min <- PortfolioAnalytics::optimize.portfolio(
+  R = returns,
+  portfolio = port.obj,
+  optimize_method = "ROI",
+  trace = FALSE)$weights
+ER_ES_min <- sum(weights_ES_min * ER_assets)
+# Vector of return targets
+n_portfolios <- 500
+return_targets <- seq(ER_ES_min,
+                      ER_assets_max,
+                      length.out = n_portfolios)
+```
+
+The maximum expected return is easy to find, it is just the portfolio consisting of the instrument with the largest average return in the lookback period. Because of diversification effects, the portfolio that minimises risk is a little more complex. We find the portfolio by solving the optimisation problem without specifying a return target and calculate the expected return of that portfolio. Lastly, a vector of 500 equispaced return targets between minimum and maximum are defined.
+
+```{r}
+# Write optimization function that returns exactly what we need.
+optimise <- function(port.obj,
+                     return_target) {
+  port.obj <- PortfolioAnalytics::add.constraint(
+    portfolio = port.obj,
+    type="return",
+    return_target = return_target)
+  out <- PortfolioAnalytics::optimize.portfolio(
+    R = returns,
+    portfolio = port.obj,
+    optimize_method = "ROI",
+    trace = FALSE)
+  return(c(out$weights, out$objective_measures$ETL))
+}
+```
+
+The optimisation function adds the target return constraint to our portfolio, determines the optimal portfolio and returns instrument weights as well as risk in the form of a vector. This is implemented in the foreachloop as it was done previously:
+
+```{r}
+# Activate cluster for foreach library and pass libraries
+cl <- parallel::makeCluster(detectCores())
+doParallel::registerDoParallel(cl)
+time_foreach <- system.time({
+  data_frontier_par <- foreach::foreach(
+    i = 1:n_portfolios,
+    .combine = rbind,
+    .packages = c("PortfolioAnalytics")) %dopar% {
+      optimise(port.obj, return_targets[i])
+    }
+})
+parallel::stopCluster(cl)
+time_foreach
+```
+
+
+
+
+
+this is a rmarkdown replication of the exercise proposed in this excelent [post](https://towardsdatascience.com/getting-started-with-parallel-programming-in-r-d5f801d43745) by [Jens Moll-Elsborg](https://towardsdatascience.com/@jens1994). I liked this example because it used a Windows system. For Linux or Mac, look into replacing parLapply with mclapply. More modifications will likely be needed.
+
